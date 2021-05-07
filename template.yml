@@ -1,0 +1,214 @@
+AWSTemplateFormatVersion: 2010-09-09
+Transform: AWS::Serverless-2016-10-31
+Description: PoC for bursting into Lambda
+
+Parameters:
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  ContainerImage:
+    Type: "String"
+
+Resources:
+  BackendFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Description: ALB Target
+      PackageType: Image
+      ImageUri: !Ref ContainerImage
+      MemorySize: 512
+      Environment:
+        Variables:
+          LAMBDA_MODE: "true"
+          MAX_PRIME: 1000
+      Events:
+        InvokeApi:
+          Type: Api
+          Properties:
+            Path: /doThing
+            Method: get
+
+  ### ALB
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: lambda-burst-poc
+      Scheme: internet-facing
+      Subnets: !Ref Subnets
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+
+  TargetGroupLambda:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: BackendFunctionInvokePermission
+    Properties:
+      Name: lambda-burst-poc-lambda
+      TargetType: lambda
+      Targets:
+        - Id: !GetAtt BackendFunction.Arn
+
+  TargetGroupECS:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    DependsOn: BackendFunctionInvokePermission
+    Properties:
+      Name: lambda-burst-poc-ecs
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8080
+      HealthCheckPath: "/doThing"
+      VpcId: !Ref VpcId
+
+  HttpListenerLambda:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupLambda
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 8080
+      Protocol: HTTP
+
+  HttpListenerECS:
+    Type: 'AWS::ElasticLoadBalancingV2::Listener'
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref TargetGroupECS
+          Type: forward
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: lambda-poc-alb
+      GroupDescription: Lambda Burst PoC Allow HTTP
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          CidrIp: 0.0.0.0/0
+
+
+  BackendFunctionInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt BackendFunction.Arn
+      Action: 'lambda:InvokeFunction'
+      Principal: elasticloadbalancing.amazonaws.com
+
+  ## ECS Service
+
+  ECSService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - HttpListenerECS
+    Properties:
+      ServiceName: lambda-burst-poc
+      LaunchType: FARGATE
+      TaskDefinition:
+        Ref: ECSTaskDefinition
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups:
+            - !Ref ECSSecurityGroup
+          Subnets: !Ref Subnets
+      DesiredCount: 1
+      LoadBalancers:
+        - TargetGroupArn:
+            Ref: TargetGroupECS
+          ContainerPort: 8080
+          ContainerName: lambda-burst
+      Cluster:
+        Ref: ECSCluster
+
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Memory: 512
+      Cpu: 256
+      NetworkMode: "awsvpc"
+      ExecutionRoleArn: !GetAtt ECSExecutionRole.Arn
+      RequiresCompatibilities:
+        - "EC2"
+        - "FARGATE"
+      ContainerDefinitions:
+        - Name: "lambda-burst"
+          Image: !Ref ContainerImage
+          Essential: true
+          Entrypoint: [ "/var/task/lambda-burst" ]
+          PortMappings:
+            - ContainerPort: 8080
+          Environment:
+            - Name: DISABLE_BURST
+              Value: "true"
+            - Name: LAMBDA_BURST_ADDRESS
+              Value: !Sub "http://${LoadBalancer.DNSName}:8080"
+            - Name: RATE_LIMIT
+              Value: 100
+            - Name: MAX_PRIME
+              Value: 10000
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ECSLogGroup
+              awslogs-region: us-east-1
+              awslogs-stream-prefix: ecs
+
+  ECSLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: "lambda-burst-poc"
+      RetentionInDays: 7
+
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName: lambda-burst-poc
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+
+  ECSExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ecs-tasks.amazonaws.com
+            Action:
+            - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  ECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: lambda-poc-ecs
+      GroupDescription: Allow http to client host
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          FromPort: -1
+          ToPort: -1
+          CidrIp: 0.0.0.0/0
+
+Outputs:
+  LoadBalancerDNSNAme:
+    Value: !GetAtt LoadBalancer.DNSName
